@@ -44,6 +44,26 @@ function createMockPc() {
 
     Color: function (r, g, b, a) { this.r = r; this.g = g; this.b = b; this.a = a; },
 
+    Vec3: (function () {
+      function Vec3(x, y, z) { this.x = x || 0; this.y = y || 0; this.z = z || 0; }
+      Vec3.prototype.copy = function (v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; };
+      Vec3.prototype.add = function (v) { this.x += v.x; this.y += v.y; this.z += v.z; return this; };
+      Vec3.prototype.mulScalar = function (s) { this.x *= s; this.y *= s; this.z *= s; return this; };
+      return Vec3;
+    })(),
+
+    // Column-major 4x4 (matches PlayCanvas). Only what the script needs.
+    Mat4: (function () {
+      function Mat4() { this.data = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
+      Mat4.prototype.mul2 = function (a, b) {
+        const A = a.data, B = b.data, o = new Array(16).fill(0);
+        for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++)
+          for (let k = 0; k < 4; k++) o[c * 4 + r] += A[k * 4 + r] * B[c * 4 + k];
+        this.data = o; return this;
+      };
+      return Mat4;
+    })(),
+
     Texture: function (device, opts) {
       this.device = device;
       Object.assign(this, opts || {});

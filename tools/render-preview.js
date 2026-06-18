@@ -240,7 +240,18 @@ gl.uniform3fv(U('uBodyTint'), new Float32Array(num('bodyTint', [0.98, 0.99, 1]))
 gl.uniform1i(U('uBounces'), 4);
 gl.uniform1f(U('uFacetDetail'), 0.28);
 gl.uniform1f(U('uFacetWalk'), num('facetScale', 0.6));
-gl.uniform1f(U('uGemRadius'), GEM_SCALE);
+// Project gem centre and a point one world-radius along camera-right into NDC,
+// then take half the NDC distance → the stone's radius in UV space (matches the
+// JS _computeGemUvRadius). Identical across GEM_SCALE → proves size-invariance.
+const projUV = (m, p) => {
+  const x = m[0]*p[0] + m[4]*p[1] + m[8]*p[2]  + m[12];
+  const y = m[1]*p[0] + m[5]*p[1] + m[9]*p[2]  + m[13];
+  const w = m[3]*p[0] + m[7]*p[1] + m[11]*p[2] + m[15];
+  return [x / w, y / w];
+};
+const nc = projUV(vp, [0, 0, 0]);
+const ne = projUV(vp, [GEM_SCALE, 0, 0]); // centre + right * world-radius
+gl.uniform1f(U('uGemUvRadius'), 0.5 * Math.hypot(ne[0] - nc[0], ne[1] - nc[1]));
 gl.uniform1f(U('uAbsorption'), 0.12);
 gl.uniform3fv(U('uAbsorptionColor'), new Float32Array([1, 1, 1]));
 

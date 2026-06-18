@@ -146,8 +146,8 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
     uniform vec3  uBodyTint;
     uniform int   uBounces;
     uniform float uFacetDetail;
-    uniform float uFacetWalk;             // frazione del raggio pietra per il ray-march
-    uniform float uGemRadius;             // raggio mondo della pietra (dall'AABB) → invarianza scala
+    uniform float uFacetWalk;             // ampiezza campionamento faccette (frazione del raggio-schermo)
+    uniform float uGemUvRadius;           // raggio della pietra proiettato in spazio-UV → invarianza scala
     uniform float uAbsorption;
     uniform vec3  uAbsorptionColor;
     uniform vec3  uKeyDir, uKeyColor;
@@ -215,33 +215,28 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
         return normalize(baseN + (T*cos(a)+B*sin(a))*uFacetDetail);
     }
 
-    // Proietta un punto mondo nello screen-space UV [0,1] della vista corrente.
-    vec2 worldToUV(vec3 P){
-        vec4 clip = matrix_viewProjection * vec4(P, 1.0);
-        return clip.xy / clip.w * 0.5 + 0.5;
-    }
-
-    // Traccia un raggio monocromatico (IOR dato). Entra dalla faccia frontale e
-    // MARCIA lungo il raggio rifratto reale: a ogni passo proietta il punto in
-    // screen-space e legge la VERA back-face normal dal prepass. Il passo è una
-    // frazione del raggio della pietra (uGemRadius) → struttura identica su
-    // pietre grandi e piccole; parte dal frammento stesso → sempre centrato.
-    vec3 traceChannel(vec3 I, vec3 Nf, float ior){
+    // Traccia un raggio monocromatico (IOR dato). Rifrange sulla faccia frontale,
+    // poi legge la VERA back-face normal dal prepass per la rifrazione d'uscita.
+    // Il PRIMO campione (b=0) cade ESATTAMENTE sul frammento (uv0) → rifrazione
+    // primaria sempre visibile e centrata. I campioni successivi si allargano di
+    // una frazione del raggio della pietra IN SPAZIO-SCHERMO (uGemUvRadius) →
+    // densità faccette identica su pietre grandi e piccole, a qualsiasi zoom.
+    vec3 traceChannel(vec3 I, vec3 Nf, vec2 uv0, float ior){
         vec3 dir = refract(I, Nf, 1.0/ior);
         if(dot(dir,dir) < 1e-5) return sampleEnv(reflect(I, Nf));
 
         vec3 tp = vec3(1.0);
         vec3 absorb = (vec3(1.0) - clamp(uAbsorptionColor, 0.0, 1.0)) * uAbsorption + vec3(uAbsorption) * 0.15;
 
-        vec3 P = vPositionW;                                              // entra dal punto frontale
-        float stepLen = uFacetWalk * uGemRadius * 2.0 / float(uBounces);  // ∝ dimensione pietra
-
         for(int b=0; b<6; b++){
             if(b >= uBounces) break;
 
-            P += dir * stepLen;                          // avanza lungo il raggio (screen-space march)
-            vec2 suv = worldToUV(P);
-            vec4 s = texture2D(uBackNormalMap, clamp(suv, 0.001, 0.999));
+            // b=0 → offset nullo (campiona il frammento). Raggio del campione in
+            // spazio-UV ∝ dimensione su schermo della pietra → invariante a scala.
+            float t   = (uBounces > 1) ? float(b) / float(uBounces - 1) : 0.0;
+            float ang = float(b) * 2.39996;              // golden angle → distribuzione regolare
+            vec2  off = vec2(cos(ang), sin(ang)) * (uFacetWalk * uGemUvRadius * t);
+            vec4  s   = texture2D(uBackNormalMap, clamp(uv0 + off, 0.001, 0.999));
             if(s.a <= 0.5){
                 return sampleEnv(dir) * tp;              // fuori silhouette → ambiente (niente buchi neri)
             }
@@ -291,6 +286,7 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
 
         // [DISPERSIONE SPETTRALE] integra N lunghezze d'onda → fire realistico.
         // Dove i cammini coincidono resta bianco; dove l'IOR li separa → colore.
+        vec2 uv = gl_FragCoord.xy / uResolution;
         vec3 refr = vec3(0.0);
         vec3 wsum = vec3(0.0);
         for(int i=0;i<12;i++){
@@ -299,7 +295,7 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
             float w = mix(400.0, 700.0, t);
             vec3 srgb = spectrumRGB(w);
             float ior = iorAt(w);
-            vec3 env = traceChannel(I, N, ior);
+            vec3 env = traceChannel(I, N, uv, ior);
             refr += env * srgb;
             wsum += srgb;
         }
@@ -408,18 +404,47 @@ DiamondRefractive.prototype.initialize = function () {
     this.on('destroy', this._onDestroy, this);
 };
 
-// Raggio della sfera contenitiva (world-space) dall'AABB delle mesh → usato per
-// rendere il ray-march interno invariante alla dimensione della pietra.
+// Raggio (world-space) e centro della sfera contenitiva dall'AABB delle mesh.
 DiamondRefractive.prototype._computeGemRadius = function () {
     var mi = this._meshInstances;
     if (!mi || !mi.length) return this._gemRadius || 1.0;
-    var r = 0.0;
+    var r = 0.0, ci = 0;
     for (var k = 0; k < mi.length; k++) {
         var he = mi[k].aabb.halfExtents;
         var rr = Math.sqrt(he.x * he.x + he.y * he.y + he.z * he.z);
-        if (rr > r) r = rr;
+        if (rr > r) { r = rr; ci = k; }
     }
+    if (!this._gemCenter) this._gemCenter = new pc.Vec3();
+    this._gemCenter.copy(mi[ci].aabb.center);
     return r > 1e-4 ? r : (this._gemRadius || 1.0);
+};
+
+// Proietta un punto mondo nel clip-space normalizzato (NDC xy) della camera.
+DiamondRefractive.prototype._projectNdc = function (cam, p) {
+    var vp = this._vp || (this._vp = new pc.Mat4());
+    vp.mul2(cam.projectionMatrix, cam.viewMatrix);
+    var d = vp.data;
+    var x = d[0] * p.x + d[4] * p.y + d[8]  * p.z + d[12];
+    var y = d[1] * p.x + d[5] * p.y + d[9]  * p.z + d[13];
+    var w = d[3] * p.x + d[7] * p.y + d[11] * p.z + d[15];
+    if (Math.abs(w) < 1e-6) w = (w < 0 ? -1e-6 : 1e-6);
+    return { x: x / w, y: y / w };
+};
+
+// Raggio della pietra proiettato in spazio-UV [0,1]: misura quanto è grande la
+// pietra SULLO SCHERMO ora → il campionamento faccette diventa invariante a
+// dimensione e zoom (occupa sempre la stessa frazione della pietra).
+DiamondRefractive.prototype._computeGemUvRadius = function () {
+    var cam = (this._cam && this._cam.camera) ? this._cam.camera : null;
+    var c = this._gemCenter;
+    if (!cam || !c) return this._gemUvRadius || 0.15;
+    var edge = this._tmpEdge || (this._tmpEdge = new pc.Vec3());
+    edge.copy(this._cam.right).mulScalar(this._gemRadius || 1.0).add(c);
+    var nc = this._projectNdc(cam, c), ne = this._projectNdc(cam, edge);
+    var dx = ne.x - nc.x, dy = ne.y - nc.y;
+    var uvR = 0.5 * Math.sqrt(dx * dx + dy * dy);   // NDC (2 unità) → UV (1 unità)
+    if (uvR > 1e-4 && isFinite(uvR)) this._gemUvRadius = uvR;
+    return this._gemUvRadius || 0.15;
 };
 
 DiamondRefractive.prototype._makeRenderTarget = function (w, h) {
@@ -490,7 +515,7 @@ DiamondRefractive.prototype._applyUniforms = function () {
     m.setParameter('uBounces', 4);
     m.setParameter('uFacetDetail', 0.28);
     m.setParameter('uFacetWalk', Math.max(0.0, this.facetScale));
-    m.setParameter('uGemRadius', this._gemRadius || 1.0);
+    m.setParameter('uGemUvRadius', this._gemUvRadius || 0.15);
 
     // Assorbimento neutro (diamante incolore) — costante, non più esposto.
     m.setParameter('uAbsorption', 0.12);
@@ -521,9 +546,9 @@ DiamondRefractive.prototype.update = function (dt) {
     dst.nearClip = s.nearClip; dst.farClip = s.farClip;
     dst.aspectRatioMode = s.aspectRatioMode; dst.aspectRatio = s.aspectRatio;
 
-    // Raggio pietra aggiornato (gestisce scala animata) → invarianza dimensione.
+    // Dimensione su schermo aggiornata (scala/zoom animati) → invarianza scala.
     this._gemRadius = this._computeGemRadius();
-    this._mainMat.setParameter('uGemRadius', this._gemRadius);
+    this._mainMat.setParameter('uGemUvRadius', this._computeGemUvRadius());
     this._mainMat.setParameter('uResolution', [device.width, device.height]);
     this._mainMat.setParameter('uTime', this._time);
     this._mainMat.setParameter('uShowBack', this.showBackNormals);

@@ -42,11 +42,18 @@ test('fragment shader implements the new realism features', () => {
   }
 });
 
-test('facet walk is the size-invariant ray-march (gem radius scaled, no fixed-world spiral)', () => {
-  assert.ok(FRAG.includes('uGemRadius'), 'expected uGemRadius (bounding-radius scale)');
-  assert.ok(FRAG.includes('uFacetWalk'), 'expected uFacetWalk (march fraction)');
-  assert.ok(FRAG.includes('worldToUV'), 'expected screen-space projection of the marched point');
+test('facet walk samples the fragment itself (centered) and scales by screen radius (size-invariant)', () => {
+  // Primary refraction reads the real back-face at the fragment's own UV.
+  assert.ok(/traceChannel\(\s*vec3 I,\s*vec3 Nf,\s*vec2 uv0,\s*float ior\)/.test(FRAG), 'traceChannel must take the fragment uv0');
+  assert.ok(/uv0 \+ off/.test(FRAG), 'must sample the back-normal map at uv0 (+ offset)');
+  assert.ok(FRAG.includes('uGemUvRadius'), 'expected uGemUvRadius (screen-space radius scale)');
+  assert.ok(FRAG.includes('uFacetWalk'), 'expected uFacetWalk (sampling spread)');
+  // b=0 → t=0 → zero offset → samples exactly the fragment → centered + always refracts.
+  assert.ok(/uBounces - 1/.test(FRAG), 'expected t = b/(uBounces-1) ramp starting at 0');
+  // legacy world-space march artefacts are gone.
   assert.ok(!FRAG.includes('uFacetStep'), 'stale fixed-world spiral step still present');
+  assert.ok(!FRAG.includes('uGemRadius'), 'stale world-space gem radius still present');
+  assert.ok(!FRAG.includes('worldToUV'), 'stale world-space march projection still present');
 });
 
 // Known non-attribute `this.*` members (runtime state + methods).
@@ -132,12 +139,33 @@ test('"brilliance" master drives contrast/levels/saturation together', () => {
   assert.ok(p.uWhite < 0.85, 'higher brilliance should pull the white point down');
 });
 
-test('"facetScale" feeds the size-invariant march + gem radius is wired', () => {
+test('"facetScale" feeds the sampling spread + projected screen radius is wired', () => {
   const inst = makeInstance({ facetScale: 0.42 });
-  inst._gemRadius = 3.3;
+  inst._gemUvRadius = 0.2;
   inst._applyUniforms();
   assert.strictEqual(inst._mainMat.params.uFacetWalk, 0.42);
-  assert.strictEqual(inst._mainMat.params.uGemRadius, 3.3);
+  assert.strictEqual(inst._mainMat.params.uGemUvRadius, 0.2);
+});
+
+test('_computeGemUvRadius is size-invariant: bigger stone seen from farther ⇒ same screen radius', () => {
+  const pc = createMockPc();
+  // Pinhole VP: ndc.x = f*Xview / (-Zview); view translates the eye back by D.
+  const f = 2.0;
+  const proj = new pc.Mat4(); proj.data = [f,0,0,0, 0,f,0,0, 0,0,0,-1, 0,0,0,0];
+  const viewAt = (D) => { const v = new pc.Mat4(); v.data = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-D,1]; return v; };
+  const scene = (radius, depth) => {
+    const inst = Object.create(DiamondRefractive.prototype);
+    inst._cam = { camera: { projectionMatrix: proj, viewMatrix: viewAt(depth) }, right: new pc.Vec3(1, 0, 0) };
+    inst._gemCenter = new pc.Vec3(0, 0, 0);
+    inst._gemRadius = radius;
+    return inst._computeGemUvRadius();
+  };
+  const near = scene(1, 5);     // small stone, close
+  const far = scene(2, 10);     // 2× stone, 2× distance → identical on-screen size
+  assert.ok(near > 0, 'screen radius should be positive');
+  assert.ok(Math.abs(near - far) < 1e-9, `expected size-invariance, got ${near} vs ${far}`);
+  // And it scales with on-screen size (closer ⇒ larger).
+  assert.ok(scene(1, 2) > scene(1, 8), 'closer stone should occupy a larger screen radius');
 });
 
 test('_applyUniforms builds a unit-length key-light direction (from envRotation)', () => {
