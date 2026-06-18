@@ -48,6 +48,7 @@ function lookAt(eye, center, up) {
   return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
           -dot3(x,eye),-dot3(y,eye),-dot3(z,eye),1];
 }
+function scaleM(s){ return [s,0,0,0, 0,s,0,0, 0,0,s,0, 0,0,0,1]; }
 function rotY(a){ const c=Math.cos(a),s=Math.sin(a); return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; }
 function rotX(a){ const c=Math.cos(a),s=Math.sin(a); return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; }
 function mat3from4(m){ return [m[0],m[1],m[2], m[4],m[5],m[6], m[8],m[9],m[10]]; }
@@ -162,9 +163,12 @@ gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
 gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rtTex, 0);
 gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRB);
 
-// matrices
-const model = mul(rotY(0.6), rotX(0.35));
-const eye = [0, 0, 3.2];
+// matrices.
+// GEM_SCALE uniformly scales geometry + camera distance + gem radius together.
+// If the facet-walk is truly size-invariant, GEM_SCALE=0.5 and =2 render IDENTICALLY.
+const GEM_SCALE = parseFloat(process.env.GEM_SCALE || '1');
+const model = mul(scaleM(GEM_SCALE), mul(rotY(0.6), rotX(0.35)));
+const eye = [0, 0, 3.2 * GEM_SCALE];
 const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
 const proj = perspective(45 * Math.PI / 180, W / H, 0.1, 100);
 const vp = mul(proj, view);
@@ -205,33 +209,52 @@ gl.uniform3fv(U('view_position'), new Float32Array(eye));
 gl.uniform2fv(U('uResolution'), new Float32Array([W, H]));
 gl.uniform1i(U('uHasEnv'), 0);
 
+// Mirror the JS master→internal mapping (see _applyUniforms) so the preview
+// matches what the editor produces from the 6 master sliders.
 const num = (k, d) => (attributes[k] && attributes[k].default !== undefined ? attributes[k].default : d);
-gl.uniform1f(U('uEnvBrightness'), num('envBrightness', 0.8));
-gl.uniform1f(U('uEnvRotation'), 0);
-gl.uniform1f(U('uStudioContrast'), num('studioContrast', 1.6));
-gl.uniform1f(U('uIorBase'), num('iorBase', 2.417));
-gl.uniform1f(U('uDispersion'), num('dispersion', 2.2));
+const ior = num('ior', 2.417);
+const fire = num('fire', 1.2);
+const brilliance = num('brilliance', 1.1);
+const sparkle = num('sparkle', 1.2);
+const envRot = num('envRotation', 0);
+
+gl.uniform1f(U('uEnvBrightness'), num('envBrightness', 0.9));
+gl.uniform1f(U('uEnvRotation'), envRot);
+gl.uniform1f(U('uIorBase'), ior);
+
+// Fire → dispersion strength (sample count comes from the CLI arg DISP).
+gl.uniform1f(U('uDispersion'), fire * 1.8);
 gl.uniform1i(U('uDispSamples'), DISP);
-gl.uniform1f(U('uFresnelBoost'), num('fresnelBoost', 1));
+
+// Brilliance → contrast / levels / saturation / studio env contrast.
+gl.uniform1f(U('uFresnelBoost'), 1.0);
 gl.uniform1f(U('uExposure'), num('exposure', 1.5));
-gl.uniform1f(U('uContrastBoost'), num('contrastBoost', 1.15));
-gl.uniform1f(U('uSaturation'), num('saturation', 1.2));
-gl.uniform1f(U('uBlack'), num('blackLevel', 0.02));
-gl.uniform1f(U('uWhite'), num('whiteLevel', 0.7));
+gl.uniform1f(U('uContrastBoost'), 1.0 + 0.30 * brilliance);
+gl.uniform1f(U('uSaturation'), 1.0 + 0.28 * brilliance);
+gl.uniform1f(U('uStudioContrast'), 1.0 + 0.65 * brilliance);
+gl.uniform1f(U('uBlack'), 0.015 * brilliance);
+gl.uniform1f(U('uWhite'), Math.max(0.25, 0.85 - 0.16 * brilliance));
 gl.uniform3fv(U('uBodyTint'), new Float32Array(num('bodyTint', [0.98, 0.99, 1])));
-gl.uniform1i(U('uBounces'), num('internalBounces', 4));
-gl.uniform1f(U('uFacetDetail'), num('facetDetail', 0.5));
-gl.uniform1f(U('uFacetStep'), num('facetStep', 0.1));
-gl.uniform1f(U('uAbsorption'), num('absorption', 0.15));
-gl.uniform3fv(U('uAbsorptionColor'), new Float32Array(num('absorptionColor', [1, 1, 1])));
-const az = num('keyAzimuth', 0.7), el = num('keyElevation', 0.6), ce = Math.cos(el);
+
+// Internal structure: size-invariant ray-march (unit sphere → gem radius 1).
+gl.uniform1i(U('uBounces'), 4);
+gl.uniform1f(U('uFacetDetail'), 0.28);
+gl.uniform1f(U('uFacetWalk'), num('facetScale', 0.6));
+gl.uniform1f(U('uGemRadius'), GEM_SCALE);
+gl.uniform1f(U('uAbsorption'), 0.12);
+gl.uniform3fv(U('uAbsorptionColor'), new Float32Array([1, 1, 1]));
+
+// Key light: direction tied to env rotation; intensity from sparkle.
+const az = envRot + 0.6, el = 0.6, ce = Math.cos(el);
 gl.uniform3fv(U('uKeyDir'), new Float32Array([ce * Math.cos(az), Math.sin(el), ce * Math.sin(az)]));
-gl.uniform3fv(U('uKeyColor'), new Float32Array(num('keyLightColor', [1, 1, 1])));
-gl.uniform1f(U('uKeyIntensity'), num('keyLightIntensity', 1.6));
-gl.uniform1f(U('uKeySharpness'), num('keyLightSharpness', 900));
-gl.uniform1i(U('uSparkleCount'), num('sparkleCount', 12));
-gl.uniform1f(U('uSparkleSharpness'), num('sparkleSharpness', 460));
-gl.uniform1f(U('uSparkleIntensity'), num('sparkleIntensity', 0.9));
+gl.uniform3fv(U('uKeyColor'), new Float32Array([1, 1, 1]));
+gl.uniform1f(U('uKeyIntensity'), sparkle * 1.3);
+gl.uniform1f(U('uKeySharpness'), 1100.0);
+
+// Sparkle → scintillation glints.
+gl.uniform1i(U('uSparkleCount'), Math.max(0, Math.min(24, Math.round(6 + sparkle * 6))));
+gl.uniform1f(U('uSparkleSharpness'), 520.0);
+gl.uniform1f(U('uSparkleIntensity'), sparkle * 0.8);
 gl.uniform1f(U('uTime'), 0.3);
 gl.uniform1i(U('uShowBack'), 0);
 

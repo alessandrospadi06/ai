@@ -49,7 +49,5 @@ test('PREPASS program compiles and links', () => {
 });
 
 test('MAIN program compiles and links', () => {
-  compileAndLink('MAIN', DiamondRefractive.MAIN_VERT, DiamondRefractive.MAIN_FRAG, {
-    needsDerivatives: true
-  });
+  compileAndLink('MAIN', DiamondRefractive.MAIN_VERT, DiamondRefractive.MAIN_FRAG);
 });

@@ -1,5 +1,5 @@
 /**
- * DiamondRefractive.js — PlayCanvas 2.19.5  |  v6.0 "Spectral Fire"
+ * DiamondRefractive.js — PlayCanvas 2.19.5  |  v7.0 "Brilliant"
  * Senior Graphics Programmer — WebGL2
  *
  * ═══════════════════════════════════════════════════════════════════════════
@@ -7,116 +7,82 @@
  * ───────────────────────────────────────────────────────────────────────────
  *   PASS 1 (prepass)  → una camera dedicata renderizza SOLO le facce POSTERIORI
  *                       (cull FRONT) e scrive la loro NORMALE mondo reale in un
- *                       Render Target. Il pass principale sa così dove e come è
- *                       orientata la superficie interna lontana.
- *
+ *                       Render Target.
  *   PASS 2 (main)     → la faccia frontale rifrange in entrata (Snell), il raggio
- *                       attraversa la pietra, colpisce la VERA back-face (dal
+ *                       marcia dentro la pietra colpendo la VERA back-face (dal
  *                       prepass), lì esce o fa Total Internal Reflection.
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * COSA CAMBIA RISPETTO ALLA v5 (per avvicinarsi alla reference fotografica)
+ * COSA CAMBIA RISPETTO ALLA v6
  * ───────────────────────────────────────────────────────────────────────────
- *  1. DISPERSIONE SPETTRALE VERA ("fire"): non più 3 IOR fissi (R/G/B), ma
- *     integrazione su N lunghezze d'onda con IOR(λ) fisica (Cauchy del diamante)
- *     e risposta spettrale→RGB (Zucconi). Genera lampi colorati realistici sui
- *     bordi delle faccette dove i cammini si separano.  → attr "Dispersion Samples"
- *  2. AMBIENTE STUDIO ad ALTO CONTRASTO: softbox in alto + pavimento scuro +
- *     key/fill → il pattern "salt & pepper" (bianco/nero netto) tipico del
- *     brillante nasce dal riflesso di un ambiente contrastato.  → attr "Studio Contrast"
- *  3. KEY LIGHT speculare diretta: flash bianchi netti che scorrono sulle
- *     faccette quando la gemma ruota.  → attr "Key Light *"
- *  4. ASSORBIMENTO Beer–Lambert lungo il cammino interno → profondità/corpo.
- *  5. TONE-MAP che PRESERVA il fire: crush dei neri + shoulder morbida +
- *     SATURAZIONE, invece del clip secco che spegneva i colori.  → attr "Saturation"
+ *  1. FACET WALK CORRETTO (era il bug principale): prima si camminava una
+ *     DISTANZA-MONDO fissa in una spirale screen-space → diamanti grandi e
+ *     piccoli avevano densità di faccette diversa e la spirale era DECENTRATA.
+ *     Ora è un RAY-MARCH screen-space lungo il RAGGIO RIFRATTO reale, che parte
+ *     dal frammento stesso (→ sempre centrato) e avanza di una frazione del
+ *     RAGGIO DELLA PIETRA (misurato dall'AABB della mesh) → resa IDENTICA su
+ *     pietre grandi e piccole, a qualsiasi zoom.
+ *  2. MENO PARAMETRI: ~25 manopole accorpate in 6 controlli "master"
+ *     (Fire, Brilliance, Sparkle, IOR, Exposure, Facet Scale). Lo script ricava
+ *     da soli tutti gli uniform interni → meno cose da regolare.
+ *  3. MENO "VETRO", PIÙ DIAMANTE: default più contrastati (neri più profondi,
+ *     bianchi che scattano), più fire e scintillazione → aspetto brillante.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * SETUP EDITOR
  * ───────────────────────────────────────────────────────────────────────────
- *  1. Metti questo script SULLA STESSA entity della mesh del diamante
- *     (componente Render o Model). La mesh DEVE avere normali FLAT.
- *  2. Trascina la tua camera di scena nell'attributo "Main Camera".
- *  3. (Consigliato) Collega una cubemap di studio HDR prefiltrata in
- *     "Environment Cubemap". Senza → fallback procedurale studio.
- *  4. Lo script crea da solo: layer, render target, camera di prepass e
- *     materiali. Niente da configurare a mano.
+ *  1. Script SULLA STESSA entity della mesh del diamante. Mesh con normali FLAT.
+ *  2. Trascina la camera di scena in "Main Camera".
+ *  3. (Consigliato) collega una cubemap HDR di studio in "Environment Cubemap".
+ *     Senza → fallback procedurale studio ad alto contrasto.
+ *  4. Lo script crea da solo layer, render target, camera di prepass e materiali.
  *
- *  DEBUG: "Show Back Normals" = true mostra la texture del prepass. Silhouette
- *  colorata (normali) → pass 1 OK. Tutto vuoto → camera/layer non agganciati.
+ *  I 6 SLIDER CHE USERAI:
+ *    • Fire        → quantità di "fuoco" (dispersione spettrale colorata).
+ *    • Brilliance  → contrasto bianco/nero e scatto dei lampi.
+ *    • Sparkle     → scintillazione + flash della key light.
+ *    • IOR         → indice di rifrazione (diamante 2.417, vetro 1.5).
+ *    • Exposure    → luminosità globale.
+ *    • Facet Scale → quanto "in profondità" pesca la struttura interna.
  *
- *  PERFORMANCE: il costo principale è (Dispersion Samples × Internal Bounces)
- *  fetch di texture. Default 4×4 = ottimo compromesso. Per più fire alza i
- *  campioni a 6–8 (hero shot); per mobile tieni 3.
+ *  DEBUG: "Show Back Normals" mostra la texture del prepass (silhouette colorata
+ *  = pass 1 OK; tutto vuoto = camera/layer non agganciati).
  */
 
 var DiamondRefractive = pc.createScript('diamondRefractive');
 
-// ── ① Riferimenti ─────────────────────────────────────────────────────────
+// ── ① Riferimenti ───────────────────────────────────────────────────────────
 DiamondRefractive.attributes.add('mainCamera', {
     type: 'entity', title: '① Main Camera',
     description: 'La camera di scena. Il prepass la sincronizza ogni frame.'
 });
 DiamondRefractive.attributes.add('envMap', {
     type: 'asset', assetType: 'cubemap', title: '② Environment Cubemap',
-    description: 'Studio HDR prefiltrato con mip. Senza → fallback procedurale.'
+    description: 'Studio HDR prefiltrato. Senza → fallback procedurale.'
 });
 
-// ── ② Indice di rifrazione e dispersione ────────────────────────────────────
-DiamondRefractive.attributes.add('iorBase',      { type: 'number', default: 2.417, min: 1.3, max: 3.0, title: 'IOR (centro spettro)',
-    description: 'IOR al centro del visibile. Diamante ≈ 2.417, vetro ≈ 1.5, zaffiro ≈ 1.77.' });
-DiamondRefractive.attributes.add('dispersion',   { type: 'number', default: 2.2, min: 0.0, max: 8.0, title: 'Dispersion (fire)',
-    description: 'Scala la separazione fisica IOR(λ). Più alto = più "fuoco" colorato.' });
-DiamondRefractive.attributes.add('dispersionSamples', { type: 'number', default: 4, min: 1, max: 12, precision: 0, title: 'Dispersion Samples',
-    description: 'Lunghezze d\'onda integrate. 3 = economico, 6–8 = fire vivido (più costoso).' });
+// ── ② Aspetto principale — i 6 controlli che userai davvero ──────────────────
+DiamondRefractive.attributes.add('ior', { type: 'number', default: 2.417, min: 1.3, max: 3.0, title: 'IOR',
+    description: 'Indice di rifrazione. Diamante ≈ 2.417, vetro ≈ 1.5, zaffiro ≈ 1.77.' });
+DiamondRefractive.attributes.add('fire', { type: 'number', default: 1.2, min: 0.0, max: 2.5, title: 'Fire (dispersione)',
+    description: 'Quantità di fuoco colorato. Pilota forza E numero di campioni spettrali.' });
+DiamondRefractive.attributes.add('brilliance', { type: 'number', default: 1.1, min: 0.0, max: 2.0, title: 'Brilliance (contrasto)',
+    description: 'Master del contrasto bianco/nero e dello scatto dei lampi. Più alto = meno "vetro".' });
+DiamondRefractive.attributes.add('sparkle', { type: 'number', default: 1.2, min: 0.0, max: 2.0, title: 'Sparkle',
+    description: 'Scintillazione + flash della key light.' });
+DiamondRefractive.attributes.add('exposure', { type: 'number', default: 1.5, min: 0.2, max: 4.0, title: 'Exposure' });
+DiamondRefractive.attributes.add('facetScale', { type: 'number', default: 0.6, min: 0.0, max: 1.5, precision: 3, title: 'Facet Scale',
+    description: 'Profondità del ray-march interno (frazione del raggio pietra). INVARIANTE a dimensione/zoom.' });
 
-// ── ③ Riflessione / ambiente ────────────────────────────────────────────────
-DiamondRefractive.attributes.add('fresnelBoost', { type: 'number', default: 1.0, min: 0.2, max: 3.0, title: 'Fresnel Boost' });
-DiamondRefractive.attributes.add('envBrightness',{ type: 'number', default: 0.8, min: 0.1, max: 5.0, title: 'Env Brightness' });
-DiamondRefractive.attributes.add('envRotation',  { type: 'number', default: 0, min: -3.15, max: 3.15, title: 'Env Rotation Y' });
-DiamondRefractive.attributes.add('studioContrast',{ type: 'number', default: 1.6, min: 0.2, max: 3.0, title: 'Studio Contrast',
-    description: 'Contrasto dell\'ambiente procedurale → genera il pattern bianco/nero.' });
+// ── ③ Ambiente ───────────────────────────────────────────────────────────────
+DiamondRefractive.attributes.add('envBrightness', { type: 'number', default: 0.9, min: 0.1, max: 5.0, title: 'Env Brightness' });
+DiamondRefractive.attributes.add('envRotation',   { type: 'number', default: 0, min: -3.15, max: 3.15, title: 'Env Rotation Y',
+    description: 'Ruota i riflessi (e con essi la direzione della key light).' });
+DiamondRefractive.attributes.add('bodyTint',      { type: 'rgb', default: [0.98, 0.99, 1.0], title: 'Body Tint' });
 
-// ── ④ Corpo / assorbimento ──────────────────────────────────────────────────
-DiamondRefractive.attributes.add('bodyTint',        { type: 'rgb', default: [0.98, 0.99, 1.0], title: 'Body Tint' });
-DiamondRefractive.attributes.add('absorption',      { type: 'number', default: 0.15, min: 0.0, max: 4.0, title: 'Absorption',
-    description: 'Attenuazione Beer–Lambert lungo il cammino interno → profondità. 0 = vetro perfetto.' });
-DiamondRefractive.attributes.add('absorptionColor', { type: 'rgb', default: [1.0, 1.0, 1.0], title: 'Absorption Color',
-    description: 'Colore che SOPRAVVIVE all\'assorbimento (diamante ≈ neutro).' });
-
-// ── ⑤ Key light (flash speculare diretto) ───────────────────────────────────
-DiamondRefractive.attributes.add('keyLightIntensity', { type: 'number', default: 1.6, min: 0.0, max: 10.0, title: 'Key Light Intensity' });
-DiamondRefractive.attributes.add('keyLightSharpness', { type: 'number', default: 900, min: 10, max: 4000, title: 'Key Light Sharpness',
-    description: 'Più alto = flash più piccoli e netti.' });
-DiamondRefractive.attributes.add('keyLightColor',     { type: 'rgb', default: [1.0, 1.0, 1.0], title: 'Key Light Color' });
-DiamondRefractive.attributes.add('keyAzimuth',        { type: 'number', default: 0.7, min: -3.15, max: 3.15, title: 'Key Light Azimuth' });
-DiamondRefractive.attributes.add('keyElevation',      { type: 'number', default: 0.6, min: -1.57, max: 1.57, title: 'Key Light Elevation' });
-
-// ── ⑥ Tone mapping / contrasto ──────────────────────────────────────────────
-DiamondRefractive.attributes.add('exposure',     { type: 'number', default: 1.5, min: 0.2, max: 4.0, title: 'Exposure' });
-DiamondRefractive.attributes.add('contrastBoost',{ type: 'number', default: 1.15, min: 1.0, max: 4.0, title: 'Contrast' });
-DiamondRefractive.attributes.add('saturation',   { type: 'number', default: 1.2, min: 0.0, max: 2.5, title: 'Saturation',
-    description: 'Esalta i colori di dispersione (fire) senza bruciarli a bianco.' });
-DiamondRefractive.attributes.add('blackLevel',   { type: 'number', default: 0.02, min: 0.0, max: 0.4, title: 'Black Level',
-    description: 'Sotto questo valore → nero puro. Alzalo per neri più profondi (più contrasto).' });
-DiamondRefractive.attributes.add('whiteLevel',   { type: 'number', default: 0.7, min: 0.2, max: 1.5, title: 'White Level',
-    description: 'Sopra questo valore → verso il bianco (brillanza). Abbassalo per più bianchi.' });
-
-// ── ⑦ Struttura interna / faccette ──────────────────────────────────────────
-DiamondRefractive.attributes.add('internalBounces',{ type: 'number', default: 4, min: 1, max: 6, precision: 0, title: 'Internal Bounces',
-    description: 'Rimbalzi interni: più alti = più faccette/struttura interna.' });
-DiamondRefractive.attributes.add('facetDetail',{ type: 'number', default: 0.5, min: 0.0, max: 0.5, title: 'Facet Detail',
-    description: 'Moltiplica le faccette apparenti (tilt deterministico). 0 = solo geometria reale.' });
-DiamondRefractive.attributes.add('facetStep',{ type: 'number', default: 0.1, min: 0.0, max: 0.5, precision: 4, title: 'Facet Walk (mondo)',
-    description: 'Distanza-MONDO per rimbalzo (invariante allo zoom). Tarala sulla scala della gemma. 0 = disattiva.' });
-
-// ── ⑧ Scintillazione (sparkle) ──────────────────────────────────────────────
-DiamondRefractive.attributes.add('sparkleCount',     { type: 'number', default: 12, min: 0, max: 24, precision: 0, title: 'Sparkle Count' });
-DiamondRefractive.attributes.add('sparkleSharpness', { type: 'number', default: 460, min: 50, max: 1024, title: 'Sparkle Sharpness' });
-DiamondRefractive.attributes.add('sparkleIntensity', { type: 'number', default: 0.9, min: 0, max: 10, title: 'Sparkle Intensity' });
-
-// ── ⑨ Misc ──────────────────────────────────────────────────────────────────
-DiamondRefractive.attributes.add('autoRotateSpeed',  { type: 'number', default: 0, min: 0, max: 90, title: 'Auto Rotate (°/s)' });
-DiamondRefractive.attributes.add('showBackNormals',  { type: 'boolean', default: false, title: '🛠 Show Back Normals (debug)' });
+// ── ④ Misc ────────────────────────────────────────────────────────────────────
+DiamondRefractive.attributes.add('autoRotateSpeed', { type: 'number', default: 0, min: 0, max: 90, title: 'Auto Rotate (°/s)' });
+DiamondRefractive.attributes.add('showBackNormals', { type: 'boolean', default: false, title: '🛠 Show Back Normals (debug)' });
 
 // ════════════════════════════════════════════════════════════════════════════
 // SHADER PREPASS — scrive la normale mondo della back-face in RGB
@@ -180,7 +146,8 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
     uniform vec3  uBodyTint;
     uniform int   uBounces;
     uniform float uFacetDetail;
-    uniform float uFacetStep;
+    uniform float uFacetWalk;             // frazione del raggio pietra per il ray-march
+    uniform float uGemRadius;             // raggio mondo della pietra (dall'AABB) → invarianza scala
     uniform float uAbsorption;
     uniform vec3  uAbsorptionColor;
     uniform vec3  uKeyDir, uKeyColor;
@@ -248,38 +215,47 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
         return normalize(baseN + (T*cos(a)+B*sin(a))*uFacetDetail);
     }
 
-    // Traccia un raggio monocromatico (IOR dato). Entra dalla faccia frontale,
-    // rimbalza sulla VERA back-face (prepass) ricampionando in screen-space a
-    // spirale (ogni rimbalzo colpisce una faccia reale diversa → struttura),
-    // applica assorbimento Beer–Lambert, esce appena Snell lo permette.
-    vec3 traceChannel(vec3 I, vec3 Nf, vec2 uv0, float wpp, float ior){
+    // Proietta un punto mondo nello screen-space UV [0,1] della vista corrente.
+    vec2 worldToUV(vec3 P){
+        vec4 clip = matrix_viewProjection * vec4(P, 1.0);
+        return clip.xy / clip.w * 0.5 + 0.5;
+    }
+
+    // Traccia un raggio monocromatico (IOR dato). Entra dalla faccia frontale e
+    // MARCIA lungo il raggio rifratto reale: a ogni passo proietta il punto in
+    // screen-space e legge la VERA back-face normal dal prepass. Il passo è una
+    // frazione del raggio della pietra (uGemRadius) → struttura identica su
+    // pietre grandi e piccole; parte dal frammento stesso → sempre centrato.
+    vec3 traceChannel(vec3 I, vec3 Nf, float ior){
         vec3 dir = refract(I, Nf, 1.0/ior);
         if(dot(dir,dir) < 1e-5) return sampleEnv(reflect(I, Nf));
 
         vec3 tp = vec3(1.0);
         vec3 absorb = (vec3(1.0) - clamp(uAbsorptionColor, 0.0, 1.0)) * uAbsorption + vec3(uAbsorption) * 0.15;
 
+        vec3 P = vPositionW;                                              // entra dal punto frontale
+        float stepLen = uFacetWalk * uGemRadius * 2.0 / float(uBounces);  // ∝ dimensione pietra
+
         for(int b=0; b<6; b++){
             if(b >= uBounces) break;
 
-            float a = float(b) * 2.39996;                  // golden angle
-            float r = uFacetStep * sqrt(float(b)) / wpp;   // raggio in pixel (spirale di Fermat)
-            vec2 off = vec2(cos(a), sin(a)) * r / uResolution;
-            vec4 s = texture2D(uBackNormalMap, clamp(uv0 + off, 0.001, 0.999));
+            P += dir * stepLen;                          // avanza lungo il raggio (screen-space march)
+            vec2 suv = worldToUV(P);
+            vec4 s = texture2D(uBackNormalMap, clamp(suv, 0.001, 0.999));
             if(s.a <= 0.5){
-                return sampleEnv(dir) * tp;   // fuori silhouette → ambiente (niente buchi neri)
+                return sampleEnv(dir) * tp;              // fuori silhouette → ambiente (niente buchi neri)
             }
             vec3 n = facetTilt(normalize(s.rgb * 2.0 - 1.0), b);
             if(dot(dir, n) > 0.0) n = -n;
 
-            tp *= exp(-absorb);               // assorbimento sul segmento percorso
+            tp *= exp(-absorb);                          // assorbimento sul segmento percorso
 
             vec3 o = refract(dir, n, ior);
             if(dot(o,o) < 1e-5){
-                dir = reflect(dir, n);        // TIR → resta dentro, prossima faccia
+                dir = reflect(dir, n);                   // TIR → resta dentro, prossima faccia
                 tp *= 0.96;
             } else {
-                return sampleEnv(o) * tp;     // esce
+                return sampleEnv(o) * tp;                // esce
             }
         }
         return sampleEnv(dir) * tp;
@@ -306,17 +282,12 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
         vec3 V = normalize(view_position - vPositionW);
         vec3 I = -V;
 
-        // Normale del retro dal prepass (screen-space). Approssimazione standard:
-        // il punto di uscita si proietta circa sullo stesso pixel (gem convessa).
-        vec2 uv = gl_FragCoord.xy / uResolution;
-        vec4 bn = texture2D(uBackNormalMap, uv);
-        bool hitBack = bn.a > 0.5;
-        vec3 Nb = normalize(bn.rgb * 2.0 - 1.0);
-
-        if(uShowBack){ gl_FragColor = vec4(hitBack ? (Nb*0.5+0.5) : vec3(0.0), 1.0); return; }
-
-        // Unità-mondo per pixel (derivate di vPositionW) → passo facet zoom-stabile.
-        float wpp = max(0.5 * (length(dFdx(vPositionW)) + length(dFdy(vPositionW))), 1e-6);
+        // Debug: mostra la normale del retro al pixel corrente.
+        if(uShowBack){
+            vec4 bn = texture2D(uBackNormalMap, gl_FragCoord.xy / uResolution);
+            gl_FragColor = vec4(bn.a > 0.5 ? bn.rgb : vec3(0.0), 1.0);
+            return;
+        }
 
         // [DISPERSIONE SPETTRALE] integra N lunghezze d'onda → fire realistico.
         // Dove i cammini coincidono resta bianco; dove l'IOR li separa → colore.
@@ -328,7 +299,7 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
             float w = mix(400.0, 700.0, t);
             vec3 srgb = spectrumRGB(w);
             float ior = iorAt(w);
-            vec3 env = traceChannel(I, N, uv, wpp, ior);
+            vec3 env = traceChannel(I, N, ior);
             refr += env * srgb;
             wsum += srgb;
         }
@@ -348,13 +319,10 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
         // ── LIVELLI ad alto contrasto, ma PRESERVANDO il fire ──
         color *= uExposure;
         color = clamp((color - vec3(uBlack)) / max(uWhite - uBlack, 1e-3), 0.0, 4.0);
-        // contrasto lineare attorno al pivot → separa nettamente le facce
-        color = 0.5 + (color - 0.5) * uContrastBoost;
-        // saturazione: esalta i colori di dispersione PRIMA del roll-off
+        color = 0.5 + (color - 0.5) * uContrastBoost;          // contrasto attorno al pivot
         float l = luma(color);
-        color = mix(vec3(l), color, uSaturation);
-        // shoulder filmica: comprime i picchi mantenendo la tinta (no clip secco a bianco)
-        color = color / (1.0 + max(color - 1.0, vec3(0.0)));
+        color = mix(vec3(l), color, uSaturation);              // satura il fire PRIMA del roll-off
+        color = color / (1.0 + max(color - 1.0, vec3(0.0)));   // shoulder filmica (no clip secco)
         color = clamp(color, 0.0, 1.0);
 
         // glint speculari additivi (scintillazione, clippano a bianco = brillanza)
@@ -371,6 +339,7 @@ DiamondRefractive.MAIN_FRAG = /* glsl */`
 // ════════════════════════════════════════════════════════════════════════════
 DiamondRefractive.prototype.initialize = function () {
     this._time = 0;
+    this._gemRadius = 1.0;
     var app = this.app, device = app.graphicsDevice;
 
     // --- Camera principale ---
@@ -418,6 +387,8 @@ DiamondRefractive.prototype.initialize = function () {
     var src = this.entity.render ? this.entity.render.meshInstances
             : (this.entity.model ? this.entity.model.meshInstances : []);
     if (!src.length) { console.error('DiamondRefractive: nessuna mesh sull\'entity.'); return; }
+    this._meshInstances = src;
+    this._gemRadius = this._computeGemRadius();
 
     // Applica il materiale principale alla mesh visibile.
     for (var i = 0; i < src.length; i++) src[i].material = this._mainMat;
@@ -435,6 +406,20 @@ DiamondRefractive.prototype.initialize = function () {
 
     this.on('attr', this._applyUniforms, this);
     this.on('destroy', this._onDestroy, this);
+};
+
+// Raggio della sfera contenitiva (world-space) dall'AABB delle mesh → usato per
+// rendere il ray-march interno invariante alla dimensione della pietra.
+DiamondRefractive.prototype._computeGemRadius = function () {
+    var mi = this._meshInstances;
+    if (!mi || !mi.length) return this._gemRadius || 1.0;
+    var r = 0.0;
+    for (var k = 0; k < mi.length; k++) {
+        var he = mi[k].aabb.halfExtents;
+        var rr = Math.sqrt(he.x * he.x + he.y * he.y + he.z * he.z);
+        if (rr > r) r = rr;
+    }
+    return r > 1e-4 ? r : (this._gemRadius || 1.0);
 };
 
 DiamondRefractive.prototype._makeRenderTarget = function (w, h) {
@@ -467,45 +452,49 @@ DiamondRefractive.prototype._applyUniforms = function () {
     m.setParameter('uHasEnv', hasEnv);
     m.setParameter('uBackNormalMap', this._tex);
 
-    // IOR + dispersione spettrale (la separazione IOR(λ) avviene nello shader)
-    m.setParameter('uIorBase',    this.iorBase);
-    m.setParameter('uDispersion', this.dispersion);
-    m.setParameter('uDispSamples', Math.max(1, Math.round(this.dispersionSamples)));
+    // ── IOR + "Fire": un solo slider pilota forza dispersione E n. campioni ──
+    var fire = Math.max(0.0, this.fire);
+    m.setParameter('uIorBase', this.ior);
+    m.setParameter('uDispersion', fire * 1.8);
+    m.setParameter('uDispSamples', Math.max(1, Math.min(10, Math.round(3.0 + fire * 2.5))));
 
-    // Ambiente / riflessione
+    // ── "Brilliance": un solo slider pilota contrasto, livelli e saturazione ──
+    var b = Math.max(0.0, this.brilliance);
+    m.setParameter('uContrastBoost', 1.0 + 0.30 * b);
+    m.setParameter('uBlack', 0.015 * b);
+    m.setParameter('uWhite', Math.max(0.25, 0.85 - 0.16 * b));
+    m.setParameter('uSaturation', 1.0 + 0.28 * b);
+    m.setParameter('uStudioContrast', 1.0 + 0.65 * b);
+    m.setParameter('uFresnelBoost', 1.0);
+
+    // ── "Sparkle": scintillazione + flash key light ──
+    var sp = Math.max(0.0, this.sparkle);
+    m.setParameter('uSparkleIntensity', sp * 0.8);
+    m.setParameter('uSparkleCount', Math.max(0, Math.min(24, Math.round(6.0 + sp * 6.0))));
+    m.setParameter('uSparkleSharpness', 520.0);
+    m.setParameter('uKeyIntensity', sp * 1.3);
+    m.setParameter('uKeySharpness', 1100.0);
+
+    // Key light: direzione legata alla rotazione dell'ambiente (elevazione fissa).
+    var az = this.envRotation + 0.6, el = 0.6, ce = Math.cos(el);
+    m.setParameter('uKeyDir', [ce * Math.cos(az), Math.sin(el), ce * Math.sin(az)]);
+    m.setParameter('uKeyColor', [1.0, 1.0, 1.0]);
+
+    // Ambiente
     m.setParameter('uEnvBrightness', this.envBrightness);
-    m.setParameter('uEnvRotation',   this.envRotation);
-    m.setParameter('uStudioContrast',this.studioContrast);
-    m.setParameter('uFresnelBoost',  this.fresnelBoost);
+    m.setParameter('uEnvRotation', this.envRotation);
+    m.setParameter('uExposure', this.exposure);
+    m.setParameter('uBodyTint', [this.bodyTint.r, this.bodyTint.g, this.bodyTint.b]);
 
-    // Corpo / assorbimento
-    m.setParameter('uBodyTint',       [this.bodyTint.r, this.bodyTint.g, this.bodyTint.b]);
-    m.setParameter('uAbsorption',     this.absorption);
-    m.setParameter('uAbsorptionColor',[this.absorptionColor.r, this.absorptionColor.g, this.absorptionColor.b]);
+    // ── Struttura interna (ray-march invariante alla scala) ──
+    m.setParameter('uBounces', 4);
+    m.setParameter('uFacetDetail', 0.28);
+    m.setParameter('uFacetWalk', Math.max(0.0, this.facetScale));
+    m.setParameter('uGemRadius', this._gemRadius || 1.0);
 
-    // Key light (direzione mondo da azimuth/elevation)
-    var ce = Math.cos(this.keyElevation);
-    m.setParameter('uKeyDir', [ce * Math.cos(this.keyAzimuth), Math.sin(this.keyElevation), ce * Math.sin(this.keyAzimuth)]);
-    m.setParameter('uKeyColor', [this.keyLightColor.r, this.keyLightColor.g, this.keyLightColor.b]);
-    m.setParameter('uKeyIntensity', this.keyLightIntensity);
-    m.setParameter('uKeySharpness', this.keyLightSharpness);
-
-    // Tone mapping
-    m.setParameter('uExposure',      this.exposure);
-    m.setParameter('uContrastBoost', this.contrastBoost);
-    m.setParameter('uSaturation',    this.saturation);
-    m.setParameter('uBlack',         this.blackLevel);
-    m.setParameter('uWhite',         this.whiteLevel);
-
-    // Struttura interna
-    m.setParameter('uBounces',     Math.round(this.internalBounces));
-    m.setParameter('uFacetDetail', this.facetDetail);
-    m.setParameter('uFacetStep',   this.facetStep);
-
-    // Scintillazione
-    m.setParameter('uSparkleCount',     Math.round(this.sparkleCount));
-    m.setParameter('uSparkleSharpness', this.sparkleSharpness);
-    m.setParameter('uSparkleIntensity', this.sparkleIntensity);
+    // Assorbimento neutro (diamante incolore) — costante, non più esposto.
+    m.setParameter('uAbsorption', 0.12);
+    m.setParameter('uAbsorptionColor', [1.0, 1.0, 1.0]);
 
     m.setParameter('uShowBack', this.showBackNormals);
     m.update();
@@ -532,6 +521,9 @@ DiamondRefractive.prototype.update = function (dt) {
     dst.nearClip = s.nearClip; dst.farClip = s.farClip;
     dst.aspectRatioMode = s.aspectRatioMode; dst.aspectRatio = s.aspectRatio;
 
+    // Raggio pietra aggiornato (gestisce scala animata) → invarianza dimensione.
+    this._gemRadius = this._computeGemRadius();
+    this._mainMat.setParameter('uGemRadius', this._gemRadius);
     this._mainMat.setParameter('uResolution', [device.width, device.height]);
     this._mainMat.setParameter('uTime', this._time);
     this._mainMat.setParameter('uShowBack', this.showBackNormals);
