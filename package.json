@@ -1,0 +1,22 @@
+{
+  "name": "ai",
+  "version": "1.0.0",
+  "description": "DiamondRefractive — PlayCanvas two-pass spectral refraction shader for gems/diamonds.",
+  "main": "Diamondrefractive.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [
+    "playcanvas",
+    "webgl",
+    "shader",
+    "diamond",
+    "refraction",
+    "dispersion"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "gl": "^8.1.6"
+  }
+}
