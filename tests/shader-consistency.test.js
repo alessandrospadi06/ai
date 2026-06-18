@@ -42,6 +42,13 @@ test('fragment shader implements the new realism features', () => {
   }
 });
 
+test('facet walk is the size-invariant ray-march (gem radius scaled, no fixed-world spiral)', () => {
+  assert.ok(FRAG.includes('uGemRadius'), 'expected uGemRadius (bounding-radius scale)');
+  assert.ok(FRAG.includes('uFacetWalk'), 'expected uFacetWalk (march fraction)');
+  assert.ok(FRAG.includes('worldToUV'), 'expected screen-space projection of the marched point');
+  assert.ok(!FRAG.includes('uFacetStep'), 'stale fixed-world spiral step still present');
+});
+
 // Known non-attribute `this.*` members (runtime state + methods).
 const RUNTIME_MEMBERS = new Set([
   'app', 'entity', 'on',
@@ -60,14 +67,22 @@ test('every attribute read via this.<name> is a registered attribute', () => {
   assert.deepStrictEqual(unknown, [], `this.<x> with no matching attribute: ${unknown.join(', ')}`);
 });
 
-test('key attributes keep sensible defaults', () => {
-  assert.strictEqual(attributes.iorBase.default, 2.417);
-  assert.strictEqual(attributes.dispersionSamples.default, 4);
-  assert.strictEqual(attributes.dispersionSamples.precision, 0);
-  assert.ok(attributes.saturation.default > 1);
-  assert.ok(attributes.studioContrast.default > 1);
-  assert.ok('keyLightIntensity' in attributes);
-  assert.ok('absorption' in attributes);
+test('attribute set is the small master-control surface', () => {
+  // The 6 core sliders + env/misc — and nothing more (parameters were reduced).
+  const expected = [
+    'mainCamera', 'envMap',
+    'ior', 'fire', 'brilliance', 'sparkle', 'exposure', 'facetScale',
+    'envBrightness', 'envRotation', 'bodyTint',
+    'autoRotateSpeed', 'showBackNormals'
+  ].sort();
+  assert.deepStrictEqual(Object.keys(attributes).sort(), expected);
+  assert.strictEqual(attributes.ior.default, 2.417);
+  assert.ok(attributes.fire.default > 0);
+  assert.ok(attributes.brilliance.default >= 1, 'brilliance default should bias away from glassy');
+  // legacy fine-grained knobs are gone
+  for (const dead of ['dispersionSamples', 'studioContrast', 'keyLightIntensity', 'absorption', 'facetStep', 'whiteLevel']) {
+    assert.ok(!(dead in attributes), `legacy attribute "${dead}" still exposed`);
+  }
 });
 
 // ── Behavioural: _applyUniforms with mocked attribute values + material ──
@@ -90,24 +105,43 @@ function makeInstance(overrides) {
   return inst;
 }
 
-test('_applyUniforms wires dispersion + spectral sample count', () => {
-  const inst = makeInstance({ iorBase: 2.42, dispersion: 3.0, dispersionSamples: 6.4 });
+test('"fire" master drives both dispersion strength and spectral sample count', () => {
+  const inst = makeInstance({ ior: 2.42, fire: 2.0 });
   inst._applyUniforms();
   const p = inst._mainMat.params;
   assert.strictEqual(p.uIorBase, 2.42);
-  assert.strictEqual(p.uDispersion, 3.0);
-  assert.strictEqual(p.uDispSamples, 6); // rounded integer
+  assert.ok(Math.abs(p.uDispersion - 3.6) < 1e-9, `uDispersion=${p.uDispersion}`); // 2.0*1.8
+  assert.strictEqual(p.uDispSamples, 8); // round(3 + 2.0*2.5)
   assert.ok(inst._mainMat.updates >= 1);
 });
 
-test('_applyUniforms clamps spectral samples to >= 1', () => {
-  const inst = makeInstance({ dispersionSamples: 0 });
-  inst._applyUniforms();
-  assert.strictEqual(inst._mainMat.params.uDispSamples, 1);
+test('spectral samples stay in [1,10] across the fire range', () => {
+  const lo = makeInstance({ fire: 0 }); lo._applyUniforms();
+  assert.strictEqual(lo._mainMat.params.uDispSamples, 3); // round(3 + 0)
+  const hi = makeInstance({ fire: 10 }); hi._applyUniforms();
+  assert.strictEqual(hi._mainMat.params.uDispSamples, 10); // clamped
 });
 
-test('_applyUniforms builds a unit-length key-light direction', () => {
-  const inst = makeInstance({ keyAzimuth: 0.7, keyElevation: 0.6 });
+test('"brilliance" master drives contrast/levels/saturation together', () => {
+  const inst = makeInstance({ brilliance: 1.0 });
+  inst._applyUniforms();
+  const p = inst._mainMat.params;
+  assert.ok(Math.abs(p.uContrastBoost - 1.30) < 1e-9);
+  assert.ok(Math.abs(p.uSaturation - 1.28) < 1e-9);
+  assert.ok(Math.abs(p.uStudioContrast - 1.65) < 1e-9);
+  assert.ok(p.uWhite < 0.85, 'higher brilliance should pull the white point down');
+});
+
+test('"facetScale" feeds the size-invariant march + gem radius is wired', () => {
+  const inst = makeInstance({ facetScale: 0.42 });
+  inst._gemRadius = 3.3;
+  inst._applyUniforms();
+  assert.strictEqual(inst._mainMat.params.uFacetWalk, 0.42);
+  assert.strictEqual(inst._mainMat.params.uGemRadius, 3.3);
+});
+
+test('_applyUniforms builds a unit-length key-light direction (from envRotation)', () => {
+  const inst = makeInstance({ envRotation: 0.7 });
   inst._applyUniforms();
   const d = inst._mainMat.params.uKeyDir;
   const len = Math.hypot(d[0], d[1], d[2]);
